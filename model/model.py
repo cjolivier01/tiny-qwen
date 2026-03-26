@@ -9,6 +9,13 @@ import torch.nn.functional as F
 from accelerate import load_checkpoint_and_dispatch
 from .vision import VisionEncoder, VisionConfig
 
+# Set to True to use flash_attn.cute (FA4) instead of F.scaled_dot_product_attention
+USE_FLASH_ATTN_CUTE = False
+
+def enable_flash_attn_cute(enable=True):
+    global USE_FLASH_ATTN_CUTE
+    USE_FLASH_ATTN_CUTE = enable
+
 
 @dataclass
 class ModelConfig:
@@ -94,13 +101,23 @@ class SelfAttention(nn.Module):
 
         q, k = self._apply_rotary_pos_emb(q, k, cos, sin)
 
-        if self.n_kv_heads < self.n_heads:
-            num_repeat = self.n_heads // self.n_kv_heads
-            k = k.repeat_interleave(num_repeat, dim=1)
-            v = v.repeat_interleave(num_repeat, dim=1)
+        if USE_FLASH_ATTN_CUTE:
+            # flash_attn.cute expects (B, T, H, D) and handles GQA natively
+            q = q.transpose(1, 2)  # (B, T, n_heads, D)
+            k = k.transpose(1, 2)  # (B, T, n_kv_heads, D)
+            v = v.transpose(1, 2)  # (B, T, n_kv_heads, D)
+            from flash_attn.cute import flash_attn_func as fa_cute
+            y, _ = fa_cute(q, k, v, causal=True)
+            y = y.contiguous().view(B, T, self.n_heads * self.d_head)
+        else:
+            if self.n_kv_heads < self.n_heads:
+                num_repeat = self.n_heads // self.n_kv_heads
+                k = k.repeat_interleave(num_repeat, dim=1)
+                v = v.repeat_interleave(num_repeat, dim=1)
 
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        y = y.transpose(1, 2).contiguous().view(B, T, self.n_heads * self.d_head)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = y.transpose(1, 2).contiguous().view(B, T, self.n_heads * self.d_head)
+
         y = self.o_proj(y)
         return y
 

@@ -17,3 +17,8 @@ textbook/
 transformers/
 tokenizers/
 runs/
+checkpoints/
+profiler_traces/
+tb_logs*/
+slurm_logs/
+data/
