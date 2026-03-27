@@ -54,14 +54,15 @@ def parse_args():
     p.add_argument("--model-name", default="Qwen/Qwen3-VL-8B-Instruct")
     p.add_argument("--random-data", action="store_true", help="Use random data for smoke testing")
     p.add_argument("--steps", type=int, default=1000)
-    p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument("--batch-size", type=int, default=6)
     p.add_argument("--seq-len", type=int, default=512)
     p.add_argument("--lr", type=float, default=1e-5)
-    p.add_argument("--grad-accum", type=int, default=1, help="Gradient accumulation steps")
+    p.add_argument("--grad-accum", type=int, default=3, help="Gradient accumulation steps (forward passes per optimizer step)")
     p.add_argument("--warmup-steps", type=int, default=50)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--log-interval", type=int, default=10)
+    p.add_argument("--eval-interval", type=int, default=100, help="Eval on held-out batch every N steps (0 to disable)")
     p.add_argument("--save-interval", type=int, default=500)
     p.add_argument("--save-dir", default="checkpoints")
     p.add_argument("--dataset-dir", default="data/llava_instruct_150k")
@@ -527,7 +528,9 @@ def main():
 
     # Training
     if rank == 0:
-        print(f"\nStarting training: {args.steps} steps, batch_size={args.batch_size}, "
+        eff_batch = args.batch_size * args.grad_accum * world_size
+        print(f"\nStarting training: {args.steps} steps, micro_batch={args.batch_size}, "
+              f"grad_accum={args.grad_accum}, effective_batch={eff_batch}, "
               f"seq_len={args.seq_len}, lr={args.lr}")
         print(f"TE FP8: {args.te_fp8}, TE FP4: {args.te_fp4}, "
               f"CUDA Graphs: {args.cuda_graphs}, Profile: {args.profile}, "
@@ -564,17 +567,34 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
 
-            with te_context_fn():
-                logits = model(input_ids=input_ids)
+            accum_loss = 0.0
+            for micro_step in range(args.grad_accum):
+                # Get micro-batch (reuse first batch from outer loop for micro_step 0)
+                if micro_step > 0:
+                    try:
+                        batch = next(data_iter)
+                    except StopIteration:
+                        epoch += 1
+                        sampler.set_epoch(epoch)
+                        data_iter = iter(dataloader)
+                        batch = next(data_iter)
+                    input_ids = batch["input_ids"].to(device)
+                    labels = batch["labels"].to(device)
 
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
-            loss = loss_fn(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-            )
+                # Skip DDP allreduce on non-final micro-steps
+                ctx = model.no_sync if micro_step < args.grad_accum - 1 else nullcontext
+                with ctx(), te_context_fn():
+                    logits = model(input_ids=input_ids)
 
-            loss.backward()
+                shift_logits = logits[:, :-1, :].contiguous()
+                shift_labels = labels[:, 1:].contiguous()
+                loss = loss_fn(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                )
+                loss = loss / args.grad_accum
+                loss.backward()
+                accum_loss += loss.item()
 
             grad_norm = None
             if args.max_grad_norm > 0:
@@ -587,7 +607,7 @@ def main():
             step_time = time.time() - step_start
             step_times.append(step_time)
             recent_times.append(step_time)
-            loss_val = loss.item()
+            loss_val = accum_loss
             total_loss += loss_val
             log_losses.append(loss_val)
 
@@ -600,7 +620,7 @@ def main():
             # FPS over last 20 batches
             if len(recent_times) > 0:
                 avg_recent = sum(recent_times) / len(recent_times)
-                fps_recent = (args.batch_size * args.seq_len * world_size) / avg_recent
+                fps_recent = (args.batch_size * args.grad_accum * args.seq_len * world_size) / avg_recent
                 tb.scalar("perf/tokens_per_sec_last20", fps_recent, step)
             tb.scalar("perf/memory_gb", torch.cuda.max_memory_allocated(device) / 1e9, step)
 
@@ -608,7 +628,7 @@ def main():
                 n = min(args.log_interval, len(log_losses))
                 avg_loss = sum(log_losses[-n:]) / n
                 avg_step_time = sum(step_times[-n:]) / n
-                tokens_per_sec = (args.batch_size * args.seq_len * world_size) / avg_step_time
+                tokens_per_sec = (args.batch_size * args.grad_accum * args.seq_len * world_size) / avg_step_time
                 mem_gb = torch.cuda.max_memory_allocated(device) / 1e9
                 gn_str = f"gnorm {grad_norm:.2f} | " if grad_norm is not None else ""
 
@@ -619,6 +639,29 @@ def main():
                       f"step_time {avg_step_time*1000:.0f}ms | "
                       f"tokens/s {tokens_per_sec:.0f} | "
                       f"mem {mem_gb:.1f}GB")
+
+            # Eval on held-out batch (right after optimizer step)
+            if args.eval_interval > 0 and (step + 1) % args.eval_interval == 0:
+                try:
+                    eval_batch = next(data_iter)
+                except StopIteration:
+                    epoch += 1
+                    sampler.set_epoch(epoch)
+                    data_iter = iter(dataloader)
+                    eval_batch = next(data_iter)
+                eval_ids = eval_batch["input_ids"].to(device)
+                eval_labels = eval_batch["labels"].to(device)
+                with torch.no_grad(), te_context_fn():
+                    eval_logits = model(input_ids=eval_ids)
+                eval_shift = eval_logits[:, :-1, :].contiguous()
+                eval_lab = eval_labels[:, 1:].contiguous()
+                eval_loss = loss_fn(
+                    eval_shift.view(-1, eval_shift.size(-1)),
+                    eval_lab.view(-1),
+                ).item()
+                tb.scalar("eval/loss", eval_loss, step)
+                if rank == 0:
+                    print(f"  [eval] step {step+1} | eval_loss {eval_loss:.4f}")
 
             if prof is not None and args.profile:
                 prof.step()
