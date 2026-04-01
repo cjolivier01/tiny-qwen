@@ -71,6 +71,7 @@ def parse_args():
     p.add_argument("--dataset-dir", default="data/llava_instruct_150k")
 
     # TE / precision
+    p.add_argument("--te", action="store_true", help="Use Transformer Engine layers (bf16, no reduced precision)")
     p.add_argument("--te-fp8", action="store_true", help="Use Transformer Engine FP8")
     p.add_argument("--te-fp4", action="store_true", help="Use Transformer Engine NVFP4")
     p.add_argument("--te-fp8-recipe", default="current_scaling",
@@ -538,13 +539,17 @@ def main():
 
     # Replace with TE layers if requested
     te_context_fn = nullcontext  # factory: callable that returns a context manager
-    if args.te_fp8 or args.te_fp4:
+    use_te = args.te or args.te_fp8 or args.te_fp4
+    if use_te:
         import transformer_engine.pytorch as te
         n_replaced = replace_with_te_layers(model, use_fp8=args.te_fp8, use_fp4=args.te_fp4)
         if rank == 0:
             print(f"Replaced {n_replaced} layers with Transformer Engine equivalents")
-        recipe = get_te_recipe(args.te_fp8_recipe, use_fp4=args.te_fp4)
-        te_context_fn = lambda: te.fp8_autocast(enabled=True, fp8_recipe=recipe)
+        if args.te_fp8 or args.te_fp4:
+            recipe = get_te_recipe(args.te_fp8_recipe, use_fp4=args.te_fp4)
+            te_context_fn = lambda: te.fp8_autocast(enabled=True, fp8_recipe=recipe)
+        elif rank == 0:
+            print("TE layers in bf16 mode (no reduced precision)")
 
     # Wrap with DDP
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
