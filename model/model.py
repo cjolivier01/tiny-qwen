@@ -431,6 +431,63 @@ class Qwen3VL(nn.Module):
 
         return model
 
+    def forward_sample(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 128,
+        temperature: float = 1.0,
+    ) -> dict:
+        """Autoregressive sampling with log-prob collection.
+
+        Args:
+            input_ids: (B, prompt_len) prompt token IDs
+            max_new_tokens: number of tokens to generate
+            temperature: sampling temperature (1.0 = standard, <1 = sharper)
+
+        Returns:
+            dict with:
+                - sampled_tokens: (B, prompt_len + gen_len) full sequence
+                - sampled_logprobs: (B, prompt_len + gen_len) per-token log-probs
+                  (prompt positions are 0.0)
+                - prompt_length: int
+        """
+        B, prompt_len = input_ids.shape
+        device = input_ids.device
+
+        sampled_tokens = input_ids.clone()
+        sampled_logprobs = torch.zeros(B, prompt_len, device=device, dtype=torch.float32)
+
+        was_training = self.training
+        self.eval()
+        with torch.no_grad():
+            for _ in range(max_new_tokens):
+                logits = self.forward(input_ids=sampled_tokens)
+                last_logits = logits[:, -1, :].float()  # (B, vocab)
+
+                log_probs = F.log_softmax(last_logits, dim=-1)
+
+                if temperature <= 0:
+                    next_token = last_logits.argmax(dim=-1, keepdim=True)
+                else:
+                    probs = torch.softmax(last_logits / temperature, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
+
+                token_log_probs = log_probs.gather(-1, next_token).squeeze(-1)  # (B,)
+
+                sampled_tokens = torch.cat([sampled_tokens, next_token], dim=1)
+                sampled_logprobs = torch.cat(
+                    [sampled_logprobs, token_log_probs.unsqueeze(1)], dim=1
+                )
+
+        if was_training:
+            self.train()
+
+        return {
+            "sampled_tokens": sampled_tokens,
+            "sampled_logprobs": sampled_logprobs,
+            "prompt_length": prompt_len,
+        }
+
     def _generate_core(
         self,
         input_ids: torch.Tensor,

@@ -63,6 +63,9 @@ def parse_args():
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--log-interval", type=int, default=10)
     p.add_argument("--eval-interval", type=int, default=100, help="Eval on held-out batch every N steps (0 to disable)")
+    p.add_argument("--is-ratio-interval", type=int, default=100, help="IS ratio eval every N steps (0 to disable)")
+    p.add_argument("--is-ratio-tokens", type=int, default=128, help="Tokens to generate for IS ratio eval")
+    p.add_argument("--is-ratio-temperature", type=float, default=1.0, help="Sampling temperature for IS ratio eval")
     p.add_argument("--save-interval", type=int, default=500)
     p.add_argument("--save-dir", default="checkpoints")
     p.add_argument("--dataset-dir", default="data/llava_instruct_150k")
@@ -425,6 +428,83 @@ def setup_distributed_from_slurm():
     os.environ.setdefault("MASTER_PORT", "29500")
 
 
+def is_ratio_eval(model, batch, device, max_new_tokens, temperature, loss_fn):
+    """Importance Sampling ratio eval: forward_sample vs teacher-forced forward.
+
+    1. Take a batch of input_ids as prompts (first half of tokens).
+    2. forward_sample: autoregressively sample tokens, collecting per-token log-probs.
+    3. forward (teacher-force): run the full sampled sequence through the model,
+       extract per-token log-probs for the generated tokens.
+    4. Compute ratio = exp(teacher_logprobs - rollout_logprobs) for generated tokens.
+
+    Returns dict with ratio stats (mean, std, min, max) and teacher-forced eval loss.
+    """
+    input_ids = batch["input_ids"].to(device)
+    B, T = input_ids.shape
+
+    # Use first half of sequence as prompt
+    prompt_len = T // 2
+    prompt_ids = input_ids[:, :prompt_len]
+
+    # Get the raw model (unwrap DDP)
+    raw_model = model.module if hasattr(model, "module") else model
+
+    # Step 1: forward_sample — autoregressive generation with log-prob collection
+    sample_result = raw_model.forward_sample(
+        input_ids=prompt_ids,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+    )
+    sampled_tokens = sample_result["sampled_tokens"]      # (B, prompt_len + gen_len)
+    rollout_logprobs = sample_result["sampled_logprobs"]   # (B, prompt_len + gen_len)
+    gen_start = sample_result["prompt_length"]
+
+    # Step 2: teacher-force — single forward pass on the sampled sequence
+    was_training = raw_model.training
+    raw_model.eval()
+    with torch.no_grad():
+        logits = raw_model(input_ids=sampled_tokens)  # (B, seq_len, vocab)
+        # logits[:, t, :] predicts token at position t+1
+        # So log-prob for token at position t is from logits[:, t-1, :]
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
+        # Gather log-probs for the actual tokens at positions gen_start onwards
+        # Token at position t was predicted by logits at position t-1
+        teacher_logprobs = log_probs[:, :-1, :].gather(
+            -1, sampled_tokens[:, 1:].unsqueeze(-1)
+        ).squeeze(-1)  # (B, seq_len - 1)
+
+    if was_training:
+        raw_model.train()
+
+    # Step 3: compute ratio for generated tokens only
+    # Generated tokens start at position gen_start, so their log-probs in
+    # teacher_logprobs are at indices gen_start-1 onwards (since teacher is shifted by 1)
+    gen_len = sampled_tokens.shape[1] - gen_start
+    if gen_len <= 0:
+        return None
+
+    # Rollout log-probs for generated tokens (positions gen_start to end)
+    rollout_gen = rollout_logprobs[:, gen_start:].float()
+    # Teacher log-probs for generated tokens (shifted by 1)
+    teacher_gen = teacher_logprobs[:, gen_start - 1: gen_start - 1 + gen_len].float()
+
+    # Align lengths
+    min_len = min(rollout_gen.shape[1], teacher_gen.shape[1])
+    rollout_gen = rollout_gen[:, :min_len]
+    teacher_gen = teacher_gen[:, :min_len]
+
+    ratio = torch.exp(teacher_gen - rollout_gen)
+
+    return {
+        "mean": ratio.mean().item(),
+        "std": ratio.std().item(),
+        "min": ratio.min().item(),
+        "max": ratio.max().item(),
+        "rollout_logprob_mean": rollout_gen.mean().item(),
+        "teacher_logprob_mean": teacher_gen.mean().item(),
+    }
+
+
 def main():
     args = parse_args()
 
@@ -662,6 +742,34 @@ def main():
                 tb.scalar("eval/loss", eval_loss, step)
                 if rank == 0:
                     print(f"  [eval] step {step+1} | eval_loss {eval_loss:.4f}")
+
+            # IS ratio eval (right after optimizer step)
+            if args.is_ratio_interval > 0 and (step + 1) % args.is_ratio_interval == 0:
+                try:
+                    is_batch = next(data_iter)
+                except StopIteration:
+                    epoch += 1
+                    sampler.set_epoch(epoch)
+                    data_iter = iter(dataloader)
+                    is_batch = next(data_iter)
+                is_stats = is_ratio_eval(
+                    model, is_batch, device,
+                    max_new_tokens=args.is_ratio_tokens,
+                    temperature=args.is_ratio_temperature,
+                    loss_fn=loss_fn,
+                )
+                if is_stats is not None:
+                    tb.scalar("is_ratio/mean", is_stats["mean"], step)
+                    tb.scalar("is_ratio/std", is_stats["std"], step)
+                    tb.scalar("is_ratio/min", is_stats["min"], step)
+                    tb.scalar("is_ratio/max", is_stats["max"], step)
+                    tb.scalar("is_ratio/rollout_logprob", is_stats["rollout_logprob_mean"], step)
+                    tb.scalar("is_ratio/teacher_logprob", is_stats["teacher_logprob_mean"], step)
+                    if rank == 0:
+                        print(f"  [is_ratio] step {step+1} | mean {is_stats['mean']:.6f} "
+                              f"std {is_stats['std']:.2e} "
+                              f"rollout_lp {is_stats['rollout_logprob_mean']:.4f} "
+                              f"teacher_lp {is_stats['teacher_logprob_mean']:.4f}")
 
             if prof is not None and args.profile:
                 prof.step()
