@@ -191,16 +191,11 @@ def replace_with_te_layers(model, use_fp8=False, use_fp4=False):
             if part:
                 parent = getattr(parent, part)
 
-        if isinstance(module, RMSNorm) and not isinstance(module, te.RMSNorm):
-            te_norm = te.RMSNorm(
-                module.weight.shape[0],
-                eps=module.variance_epsilon,
-            )
-            te_norm.weight = module.weight
-            setattr(parent, child_name, te_norm)
-            replaced += 1
+        # Skip RMSNorm — TE's cooperative kernel introduces non-deterministic
+        # reductions that change with sequence length, causing IS ratio noise.
+        # Keep the stock RMSNorm which is bit-deterministic.
 
-        elif isinstance(module, nn.Linear) and not isinstance(module, te.Linear):
+        if isinstance(module, nn.Linear) and not isinstance(module, te.Linear):
             te_linear = te.Linear(
                 module.in_features,
                 module.out_features,
